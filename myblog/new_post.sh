@@ -17,7 +17,7 @@ filename=$date_pattern$clean_title.md
 #author=`git config --get user.name`
 author="jliu9"
 
-cat > "posts/."$filename <<EOF
+cat > "posts/"$filename <<EOF
 ---
 title: $title
 author: $author
