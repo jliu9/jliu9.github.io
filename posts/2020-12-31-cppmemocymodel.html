@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="x-ua-compatible" content="ie=edge">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>My Blog - C++ Memory Model and Ordering (1)</title>
+        <link rel="stylesheet" href="../css/default.css" />
+    </head>
+    <body>
+        <header>
+            <div class="logo">
+                <a href="../">My Blog</a>
+            </div>
+            <nav>
+                <a href="../">Home</a>
+                <a href="../about.html">About</a>
+                <a href="../contact.html">Contact</a>
+                <a href="../archive.html">Archive</a>
+            </nav>
+        </header>
+
+        <main role="main">
+            <h1>C++ Memory Model and Ordering (1)</h1>
+            <article>
+    <section class="header">
+        Posted on December 31, 2020
+        
+            by jliu9
+        
+    </section>
+    <section>
+        <p>This article tries to articulate my understanding of C++ memory and ordering model. I learned this by reading the book “C++ Concurrency in Action” and found the examples pretty helpful.</p>
+<p>If time permitted, I might write more about this (as you see (1) in the title!). Let’s assume all the variables we talk about bellowing is some type of <code>std::atomic&lt;T&gt;</code>.</p>
+<h3 id="two-important-relationships">Two important relationships</h3>
+<h4 id="happens-before">Happens-before</h4>
+<p>Happens-before relationship specifies which operations see the effects of which other operations</p>
+<ul>
+<li>Let’s start from the simplest case, single-thread:
+<ul>
+<li>Given certain object, if one operation is sequenced before another, then it also happens-before it.
+<ul>
+<li>That is, even in the same thread, operations on two different objects may be re-ordered if there is no ordering constraint that is defined for those two.</li>
+</ul></li>
+</ul></li>
+<li>Inter-thread happens-before is relatively simple and relies on the synchronize-with relation.
+<ul>
+<li>One important property is <em>happens-before</em> is a transitive relation.</li>
+</ul></li>
+</ul>
+<h4 id="synchronize-with">Synchronize-with</h4>
+<p>The synchronize-with relationship is something you can get <em>only</em> between operations on atomic types.</p>
+<p>The basic idea is is that, given certain definition of rule for atomic variable (<code>x</code>), write operation (<code>W</code>) synchronize-with read (<code>R</code>) operation on <code>x</code>. We can say that <em>reading</em> an atomic variable triggers a synchronization with one <em>writing</em> operation to that variable.</p>
+<ul>
+<li>The interesting thing comes from the fact that in computer, let’s say <code>x</code> is modified several times and thus have several intermediate versions, <code>{x_v1, x_v2, ...}</code>, which version of <code>x</code> is actually seen by <code>R</code> might be different across several runs, resulting in several possible legal sequences.</li>
+<li>Then the interesting quesion is: what is regarded as <em>legal sequences</em>?</li>
+</ul>
+<h3 id="three-ordering-levels">Three Ordering Levels</h3>
+<p>These three ordering level looks pretty familar w.r.t. any sequence that requires consistency. Like Database transaction, distributed system coordination.</p>
+<p>As what we we can guess from the name, from the strongest to the weakest: <em>Sequential Ordering</em> &gt; <em>Acquire-Release Ordering</em> &gt; <em>Relaxed Ordering</em></p>
+<p>To summary:</p>
+<ul>
+<li><em>Sequential</em>: Once a snapshot is seen by one thread, that is also valid view (may be seen) for all threads, including all the values that have been written.</li>
+<li><em>Acquire-Release</em>: Once a value is written (v2), next read must see at least that value of or a version after that, and this invariant hollds for all the readers.</li>
+<li><em>Relaxed</em>: Once a value is written (v1), eventually, it will be seen, but any thread can see any version since v1, e.g., R1 sees v0, R2 sees v3. The only guarantee is R1 cannot see v4 then v0; R2 cannot see v3 then v2.</li>
+</ul>
+<p>One small trick is to differentiate the logic sequence vs. the one global truth. That is, <em>once a value is written, reader must see that</em> does not necessarily mean program will generate that v1,v2 sequence, because you cannot control reader is scheduled to be run exactly after writer’s writing. So when we see one example, it’s a good idea to work with these invariant to generate <em>test cases</em>; walk though and see if some result is possible.</p>
+<p>Here is two good examples to guide through the understanding of these three ordering levels.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true"></a><span class="pp">#include </span><span class="im">&lt;atomic&gt;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true"></a><span class="pp">#include </span><span class="im">&lt;cassert&gt;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true"></a><span class="pp">#include </span><span class="im">&lt;thread&gt;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true"></a><span class="pp">#if (defined) SEQ_ORDER</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true"></a><span class="pp">#define mem_order_read </span><span class="bu">std::</span>memory_order_seq_cst</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true"></a><span class="pp">#define mem_order_write </span><span class="bu">std::</span>memory_order_seq_cst</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true"></a><span class="pp">#elif (defined) ACQUIRE_RELASE</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true"></a><span class="pp">#define mem_order_read </span><span class="bu">std::</span>memory_order_acquire</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true"></a><span class="pp">#define mem_order_write </span><span class="bu">std::</span>memory_order_release</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true"></a><span class="pp">#else  </span><span class="co">// RELAXED</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true"></a><span class="pp">#define mem_order_read </span><span class="bu">std::</span>memory_order_relaxed</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true"></a><span class="pp">#define mem_order_write </span><span class="bu">std::</span>memory_order_relaxed</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true"></a><span class="pp">#endif</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true"></a><span class="bu">std::</span>atomic&lt;<span class="dt">bool</span>&gt; x, y;</span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true"></a><span class="bu">std::</span>atomic&lt;<span class="dt">int</span>&gt; val;</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true"></a></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true"></a><span class="co">/**</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true"></a><span class="co">* Example-1</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true"></a><span class="co">* - Sequential: assertion not fire</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true"></a><span class="co">* - Acquire-Release: assertion can fire</span></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true"></a><span class="co">* - Relaxed: assertion can fire</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true"></a><span class="co">*/</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true"></a></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true"></a><span class="dt">void</span> write_x() { x.store(<span class="kw">true</span>, mem_order_write); }</span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true"></a></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true"></a><span class="dt">void</span> write_y() { x.store(<span class="kw">true</span>, mem_order_write); }</span>
+<span id="cb1-29"><a href="#cb1-29" aria-hidden="true"></a></span>
+<span id="cb1-30"><a href="#cb1-30" aria-hidden="true"></a><span class="dt">void</span> read_x_then_y() {</span>
+<span id="cb1-31"><a href="#cb1-31" aria-hidden="true"></a>  <span class="cf">while</span> (!x.load(mem_order_read))</span>
+<span id="cb1-32"><a href="#cb1-32" aria-hidden="true"></a>    ;</span>
+<span id="cb1-33"><a href="#cb1-33" aria-hidden="true"></a>  <span class="cf">if</span> (y.load(mem_order_read)) {</span>
+<span id="cb1-34"><a href="#cb1-34" aria-hidden="true"></a>    val++;</span>
+<span id="cb1-35"><a href="#cb1-35" aria-hidden="true"></a>  }</span>
+<span id="cb1-36"><a href="#cb1-36" aria-hidden="true"></a>}</span>
+<span id="cb1-37"><a href="#cb1-37" aria-hidden="true"></a></span>
+<span id="cb1-38"><a href="#cb1-38" aria-hidden="true"></a><span class="dt">void</span> read_y_then_x() {</span>
+<span id="cb1-39"><a href="#cb1-39" aria-hidden="true"></a>  <span class="cf">while</span> (!y.load(mem_order_read))</span>
+<span id="cb1-40"><a href="#cb1-40" aria-hidden="true"></a>    ;</span>
+<span id="cb1-41"><a href="#cb1-41" aria-hidden="true"></a>  <span class="cf">if</span> (x.load(mem_order_read)) {</span>
+<span id="cb1-42"><a href="#cb1-42" aria-hidden="true"></a>    val++;</span>
+<span id="cb1-43"><a href="#cb1-43" aria-hidden="true"></a>  }</span>
+<span id="cb1-44"><a href="#cb1-44" aria-hidden="true"></a>}</span>
+<span id="cb1-45"><a href="#cb1-45" aria-hidden="true"></a></span>
+<span id="cb1-46"><a href="#cb1-46" aria-hidden="true"></a><span class="dt">int</span> main() {</span>
+<span id="cb1-47"><a href="#cb1-47" aria-hidden="true"></a>  x = y = <span class="kw">false</span>;</span>
+<span id="cb1-48"><a href="#cb1-48" aria-hidden="true"></a>  val = <span class="dv">0</span>;</span>
+<span id="cb1-49"><a href="#cb1-49" aria-hidden="true"></a>  <span class="bu">std::</span>thread t1(write_x);</span>
+<span id="cb1-50"><a href="#cb1-50" aria-hidden="true"></a>  <span class="bu">std::</span>thread t2(write_y);</span>
+<span id="cb1-51"><a href="#cb1-51" aria-hidden="true"></a>  <span class="bu">std::</span>thread t3(read_x_then_y);</span>
+<span id="cb1-52"><a href="#cb1-52" aria-hidden="true"></a>  <span class="bu">std::</span>thread t4(read_y_then_x);</span>
+<span id="cb1-53"><a href="#cb1-53" aria-hidden="true"></a>  t1.join(); t2.join(); t3.join(); t4.join();</span>
+<span id="cb1-54"><a href="#cb1-54" aria-hidden="true"></a>  <span class="ot">assert</span>(val.load() != <span class="dv">0</span>); <span class="co">// fire or not?</span></span>
+<span id="cb1-55"><a href="#cb1-55" aria-hidden="true"></a>}</span></code></pre></div>
+<div class="sourceCode" id="cb2"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true"></a></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true"></a><span class="co">/**</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true"></a><span class="co">* Example-2</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true"></a><span class="co">* sequential: will not fire</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true"></a><span class="co">* Acquire-Release: will not fire</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true"></a><span class="co">* Relaxed: may fire</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true"></a><span class="co">*/</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true"></a><span class="dt">void</span> write_x_then_y() {</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true"></a>  x.store(<span class="kw">true</span>, mem_order_write);</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true"></a>  y.store(<span class="kw">true</span>, mem_order_write);</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true"></a>}</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true"></a><span class="dt">void</span> read_y_then_x() {</span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true"></a>  <span class="cf">while</span>(!y.load(mem_order_read));</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true"></a>  <span class="cf">if</span>(x.load(mem_order_read)) {</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true"></a>    val++;</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true"></a>  }</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true"></a>}</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true"></a></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true"></a><span class="dt">int</span> main() {</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true"></a>  x = y = <span class="kw">false</span>;</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true"></a>  val = <span class="dv">0</span>;</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true"></a>  <span class="bu">std::</span>thread t1(write_x_then_y);</span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true"></a>  <span class="bu">std::</span>thread t2(read_y_then_x);</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true"></a>  t1.join(); t2.join();</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true"></a>  <span class="ot">assert</span>(val.load() != <span class="dv">0</span>); <span class="co">// fire or not?</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true"></a>  <span class="cf">return</span> <span class="dv">0</span>;</span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true"></a>}</span></code></pre></div>
+<h4 id="sequential-consistent-total-ordering">Sequential Consistent (total ordering)</h4>
+<ul>
+<li>Sequential consistency implies a total order.
+<ul>
+<li>The behavior of the program is consistent with a single sequential view of the world.</li>
+<li>If all operations on instances of atomic types are sequentially consistent, the behavior of a multithreaded program is as if all these operations were performed in some <em>particular</em> sequence by a single thread.</li>
+<li><em>ALL</em> threads must see the same order of operations.</li>
+<li>If your code has one atomic operation before another in one thread, that ordering must be seen by other threads. (even though to different variables)</li>
+</ul></li>
+<li>It is the default ordering guarantee of those atomic variables’ overloaded member functions.</li>
+<li>From the programming level, it can be explicitly stated as <code>std::memory_order_seq_cst</code>.</li>
+</ul>
+<h4 id="acquire-release-ordering">Acquire-release Ordering</h4>
+<ul>
+<li>A release operation synchronize-with an acquire operation that reads the value written.</li>
+<li>A pair of order: <code>std::memory_order_acquire</code>, <code>std::memory_order_release</code>.</li>
+<li>A release operation synchronize-with an acquire operation that reads the value written.</li>
+<li>In order to see the benefit of acquire-release ordering, you need to consider two stores from the same thread (exmple-2).</li>
+<li>We compare the above two by drawing the happen-before diagram, and the difference is rather obvious.
+<ul>
+<li>Legend - arrow: happen-before; gray text: return value;</li>
+<li>Note the <em>red dashed</em> arrow is the key.</li>
+</ul></li>
+</ul>
+<center>
+<img src="../images/cppmemorymodel-1.png" alt="Happen Before - Example1" height="400" width="600">
+</center>
+<h4 id="relaxed-ordering">Relaxed Ordering</h4>
+<ul>
+<li>Operations on atomic types performed with relaxed ordering don’t participate in synchronize-with relationships.</li>
+<li>It is <code>std::memory_order_relaxed</code>.</li>
+<li>Operations on the same variable within a single thread still obey happens-before relationships, but there’s almost no requirement on ordering relative to other threads.</li>
+<li>The only requirement is that accesses to a single atomic variable from the same thread can’t be reordered.
+<ul>
+<li>once a given thread has seen a particular value of an atomic variable, a subsequent read by that thread can’t retrieve an ealier value of an atomic variable.</li>
+</ul></li>
+</ul>
+<hr />
+<p>Finally, thanks <span class="citation" data-cites="lyf">@lyf</span> for pushing this to be public. :)</p>
+<p>Happy new year!</p>
+    </section>
+</article>
+
+        </main>
+
+        <footer>
+            Site proudly generated by
+            <a href="http://jaspervdj.be/hakyll">Hakyll</a>
+        </footer>
+    </body>
+</html>
