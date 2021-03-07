@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="x-ua-compatible" content="ie=edge">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>My Private Blog - NVMe Command Submission and Completion Mechanism</title>
+        <link rel="stylesheet" href="../css/default.css" />
+    </head>
+    <body>
+        <header>
+            <div class="logo">
+                <a href="../">My Private Blog</a>
+            </div>
+            <nav>
+                <a href="../">Home</a>
+                <a href="../about.html">About</a>
+                <a href="../contact.html">Contact</a>
+                <a href="../archive.html">Archive</a>
+            </nav>
+        </header>
+
+        <main role="main">
+            <h1>NVMe Command Submission and Completion Mechanism</h1>
+            <article>
+    <section class="header">
+        Posted on January 22, 2021
+        
+            by jliu9
+        
+    </section>
+    <section>
+        <p>Followed by the last <a href="2021-01-20-spdkio.html">post</a>, I’m just wondering how <em>submission queue</em> and <em>completion queue</em> works. Essentially, there is ynchronization and I’d like to understand its detail to see if I can find the cause of long tail, because maybe there is some periodical operations that I am not aware of.</p>
+<h3 id="terms">Terms</h3>
+<ul>
+<li>The NVMe Express (NVMe) interface allows host software to communicate with a non-valatile memory subsystem.</li>
+<li>Namespace: A quantity of non-valatile memory that may be formatted into logical blocks.</li>
+<li>SQ (Submission Queue): A submission queue is a circular buffer with a fixed slot size that the host software used to submit commands for execution by the controller.
+<ul>
+<li>The controller fetches the Submission Queue and may execute those commands in any order.</li>
+<li>Each Submission Queue entry is a command. Commands are 64 bytes in size. The physical memory locations in memory to use for data transfers are specified using Physical Region Page (PRP) entries or Scatter Gather Lists.</li>
+</ul></li>
+<li>CQ (Completion Queue): A circular buffer with a fixed slot size used to post status for completed commands. A completed command is uniquely identified by a combination of the associated SQ identifer and command identifer that is assigned by host software.
+<ul>
+<li>The CQ Head pointer is updated by host software after processing completion queue entries indicating the last free CQ slot. A Phase Tag (P) bit is defined in the completion queue entry to indicate whether an entry has been newly posted without consulting a register. This enables host software to determine whether the new entry was posted as part of the previous or current round of completion notifications.</li>
+<li>Specifically, each round through the Completion Queue entries, the controller inverts the Phase Tag bit.</li>
+</ul></li>
+<li>Controller:
+<ul>
+<li>A controller is the inferface between a host and an NVM subsystem. There are three types of controllers:
+<ul>
+<li>I/O Controller</li>
+<li>Discovery controllers; and</li>
+<li>Administrative controllers</li>
+</ul></li>
+<li>A controller executes command submitted by a host on a submission queue and posts an completion on a Completion Queue.</li>
+</ul></li>
+</ul>
+<h3 id="registers">Registers</h3>
+<h4 id="pci-header">PCI Header</h4>
+<p>The header contains the address (aka. pointer) of other registers and some other metadata. It’s always indirection sort of thing. The format is like this:</p>
+<pre class="shell"><code>     0x0  0x1  0x2  0x3  0x4  0x5  0x6  0x7  0x8  0x9  0xa  0xb  0xc  0xd  0xe  0xf
+0x00:|-      ID      -|  |-CMD-|   |-STS-|   RID  |-    CC   -|  CLS  MLT HTYPE BIST
+0x10:|-     MLBAR    -|  |-     MUBAR    -|  |-     BAR2     -|  |-     BAR3     -|
+0x20:|-     BAR4     -|  |-     BAR5     -|  |-    CCPTR     -|  |-      SS      -|
+0x30:|-     EROM     -|  CAP  |-          Reserved           -|  |-INTR-|  MGNT MLAT</code></pre>
+<p>Some notable fields:</p>
+<ul>
+<li>CMD: Command Register</li>
+<li>CLS: Cache Line Size</li>
+<li>HTYPER: Header Type</li>
+<li>MLBAR: Memory Register Base Address, lower 32-bits <BAR0></li>
+<li>MUBAR: Memory Register Base Address, upper 32-bits <BAR1></li>
+<li>SS: Subsystem Identifier</li>
+<li>INTR: Interrupt Information</li>
+</ul>
+<h4 id="controller-registers">Controller Registers</h4>
+<p>Controller registers are located in the MLBAR/MUBAR registers (PCI BAR0 and BAR1) that shall be mapped to a memory space that supports in-order access and variable access width. For many computer architectures, specifying the memory space as uncacheable processing producing this behavior.</p>
+<pre class="shell"><code>      0x0  0x1  0x2  0x3  0x4  0x5  0x6  0x7  0x8  0x9  0xa  0xb  0xc  0xd  0xe  0xf
+ 0x00:|-   CAP: Controller Capabilities   -|  |- VS: Version  -|  |-     INTMS     -|
+ 0x10:|-     INTMC    -|  |-      CC      -|  |-   Reserved   -|  |-  CSTS: Status -|
+ 0x20:|-    NSSR [O]  -|  |-      AQA     -|  |- ASQ: Admin Submission Queue Addr  -|
+ 0x30:|- ACQ: Admin Completion Queue Addr -|  |-  CMBLOC [O]  -|  |-   CMBSZ [O]   -|
+...
+...
+ 0xe0:
+0x100:|-    SQ0TDBL   -|
+0x1000+(1*4&lt;&lt;CAP.DSTRD) -- 0x1003+(1*4&lt;&lt;CAP.DSTRD): |-CQ0HDBL-|</code></pre>
+<p>Then followed by the non-admin queue pairs like this (Note: not in 16 bytes per line format):</p>
+<pre class="shell"><code>0x1000+(2*4&lt;&lt;CAP.DSTRD) -- 0x1003+(2*4&lt;&lt;CAP.DSTRD): Submission Queue 1 Tail Doorbell
+0x1000+(3*4&lt;&lt;CAP.DSTRD) -- 0x1003+(3*4&lt;&lt;CAP.DSTRD): Completion Queue 1 Head Doorbell
+0x1000+(4*4&lt;&lt;CAP.DSTRD) -- 0x1003+(4*4&lt;&lt;CAP.DSTRD): Submission Queue 2 Tail Doorbell
+0x1000+(5*4&lt;&lt;CAP.DSTRD) -- 0x1003+(5*4&lt;&lt;CAP.DSTRD): Completion Queue 2 Head Doorbell
+...</code></pre>
+<ul>
+<li>SQ0TDBL: Submission Queue 0 Tail Doorbell (Admin).
+<ul>
+<li><em>SQT: Indicates the new value of the Submission Queue Tail entry pointer. This value shll overwrite any previous Submission Queue Tail entry pointer value provided. The difference between the last SQT write and the current SQT write indicates the number of commands added to the Submission Queue.</em>
+<ul>
+<li>rollover needs to be accounted for by the host.</li>
+</ul></li>
+</ul></li>
+<li>CQ0HDBL: Completion Queue 0 Head Doorbell (Admin).
+<ul>
+<li><em>Completion Queue Head (CQH): Indicates the new value of the Completion Queue Head entry pointer. This value shall overwrite any previous Completion Queue Head value provided. The difference between the last CQH write and the current CQH entry pointer write indicates the number of entries that are now available for re-use by the controller in the Completion Queue.</em>
+<ul>
+<li>again, host handles rollover</li>
+</ul></li>
+</ul></li>
+<li>CAP.DSTRD: doorbell stride, Each Submission Queue and Completion Queue Doorbell register is 32-bits in size. This register indicates the stride between doorbell registers. The stride is specified as (2^(2+DSTRD)) in bytes, A value of <code>0h</code> indicates a stride of 4 bytes, where the doorbell registers are packed without reserved space between each register.</li>
+<li><code>[O]</code>: Optional.</li>
+</ul>
+<p>So if we assume DSTRD is <code>0h</code>, the doorbell registers will look like this:</p>
+<pre class="shell"><code>      0x0  0x1  0x2  0x3  0x4  0x5  0x6  0x7  0x8  0x9  0xa  0xb  0xc  0xd  0xe  0xf
+0x100:|-    SQ0TDBL   -|  |-    CQ0HDBL   -|  |-    SQ1HDBL   -|  |-    CQ1HDBL   -|
+0x101:|-    SQ2TDBL   -|  |-    CQ2HDBL   -| ...</code></pre>
+<h3 id="how-nvme-io-w-polling-host-works-data-structures-and-algorithms">How NVMe IO (w/ polling host) works? Data Structures and Algorithms</h3>
+<p>Or, this section is about the mechanism of <em>command submission and completion</em>. It is the data structures and algorithms, together, constitute the mechanism.</p>
+<p>The central data structures used for this data transfer between the host and controller is the <code>qpair</code> (one submission queue and one completion queue), plus two doorbells. One particular noteworthy thing here is <em>each of the doorbell register is only written by the host</em>.</p>
+<p>The <code>qpair</code> basically means a pair of queue, one for submission request and one for completion. It is organized as a circular buffer, with each entry size set to 64Byte. In submission, the host is the producer and thus updates the tail of SQ. For completion processing, the host, as the consumer, will update the head of CQ.</p>
+<center>
+<img src="../images/nvme-queue.png" alt="Submission/Completion Queue" height="217" width="400">
+</center>
+<p>The format of completion entry is:</p>
+<pre class="shell"><code>        0x0  0x1  0x2  0x3  0x4  0x5  0x6  0x7  0x8  0x9  0xa  0xb  0xc  0xd  0xe  0xf
+DWord0: |-                             Command Spefic                               -|
+DWord1: |-                                  Reserved                                -|
+DWord2: |-         SQ Header Pointer        -|  |-          SQ Identifier           -|
+DWord3: |-         Command Identifer        -| |-P-|  |-        Status Field        -|</code></pre>
+<p>The [P] bit is <em>Phase Tag</em>, indicating whether a completion queue entry is new. Basically, in each round of this circular buffer (CQ), the Phase Tag has one value, and is inverted once passed through.</p>
+<p>The detailed steps of this submission/completion mechanism is depicted in the bellow pic. In description, the controller parts are italic.</p>
+<ol type="1">
+<li>The host write commands for execution to the next free slots in SQ. (maybe several entries).</li>
+<li>The host updates the SQiTDBL</li>
+<li><em>The controller fetches the commands in SQ slots into its own memory</em></li>
+<li><em>The controller executes the commands</em> (Note execution may be in the different order)</li>
+<li><em>The controller writes entry to CQ</em></li>
+<li>The host consumes the completion.</li>
+<li>The host updates the CQiHDBL to indicate the entry has been consumed.</li>
+</ol>
+<center>
+<img src="../images/nvme-mechanism.png" alt="Submission/Completion Mechanism" height="376" width="600">
+</center>
+<p>A small trick here is that, the controller uses SQ Head Pointer (SQHD) field in CQ entries to communicate the most recent value of SQ Header Pointer to the host, which indicates that SQ entries have been consumed by the controller, but does not indicate either execution or completion of any command.</p>
+<h3 id="reference">Reference</h3>
+<ul>
+<li>NVMe Specicifcation v1.4. <a href="https://nvmexpress.org/wp-content/uploads/NVM-Express-1_4-2019.06.10-Ratified.pdf">link</a></li>
+</ul>
+    </section>
+</article>
+
+        </main>
+
+        <footer>
+            Site proudly generated by
+            <a href="http://jaspervdj.be/hakyll">Hakyll</a>
+        </footer>
+    </body>
+</html>

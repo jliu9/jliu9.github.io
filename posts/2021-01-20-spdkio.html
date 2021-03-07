@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="x-ua-compatible" content="ie=edge">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>My Private Blog - SPDK NVMe Driver I/O Path</title>
+        <link rel="stylesheet" href="../css/default.css" />
+    </head>
+    <body>
+        <header>
+            <div class="logo">
+                <a href="../">My Private Blog</a>
+            </div>
+            <nav>
+                <a href="../">Home</a>
+                <a href="../about.html">About</a>
+                <a href="../contact.html">Contact</a>
+                <a href="../archive.html">Archive</a>
+            </nav>
+        </header>
+
+        <main role="main">
+            <h1>SPDK NVMe Driver I/O Path</h1>
+            <article>
+    <section class="header">
+        Posted on January 20, 2021
+        
+            by jliu9
+        
+    </section>
+    <section>
+        <p>I realize I’d better understand fair amount of detail about SPDK’s internal IO submission and polling mechanism.</p>
+<p>This comes from the observation that, When I did experiment which constantly issue 4K sequential read request for <code>15</code> econds, the tail latency could be as bad as <code>~=850</code> us. By exploring a bit more, I figured out <code>spdk_nvme_qpair_process_completions()</code> itself may consume that long time period.</p>
+<p>This is a quite unpleasant symptom, yet I cannot make sense of that. Conceptually, when submitting IO to the device, the SPDK NVMe driver allocate some struct, write the NVMe command into that struct, and write to some register to ring the doorbell. And at the time of <em>polling the completion</em>, user thread invoke <code>spdk_nvme_qpair_process_completions</code>, which checks some bit of completion pending queue to see if the IO is done. Nay, the measured time of <code>spdk_nvme_qpair_process_completions</code> includes: a). the state maintainance of the NVMe completion (device level). b). invoke the user supplied function that was passed in as an argument for calling <code>spdk_nvme_ns_cmd_read()</code>.</p>
+<p>Precisely, the issue first shows up when I runs experiments for FSP to study the CPU utilization when changing the load to device. So I suspect if my callback function has bugs, or SPDK itself has some limitation once in a while. Then I use the <code>perf</code> tool of SPDK examples to rule out the latter case. Basically, that program does not have a lot of work in IO completion callback function. The result remains the same, simple timing indicates long time spending inside <code>spdk_nvme_qpair_process_completions</code>. Worse, If I bind the device back to the kernel and use <code>linux aio</code> instead, the <code>io_getevents()</code> also takes that long time.</p>
+<p>I’m quite confused because even if device itself has some internal issue which turns out into bad tail, why it even influences the <code>spdk_nvme_qpair_process_completions</code> time? Shouldn’t it simply get <em>completion == 0</em> when the device stalls?</p>
+<p>I’m using <code>SPDK 18.04</code> (Well, the latest version as of this writing is <code>21.04</code>, where is my time go), but I bet the mechanism does not change that much. SPDK webpage has some nice high-level introduction of the NVMe Driver (a good read. (<a href="https://spdk.io/doc/nvme_spec.html">link</a>))</p>
+<h3 id="io-request-submission">IO Request Submission</h3>
+<p>The API of device submission request is shown bellow.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true"></a><span class="co">// include/spdk/nvme.h</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true"></a><span class="dt">int</span> spdk_nvme_ns_cmd_read(</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true"></a>  <span class="kw">struct</span> spdk_nvme_ns *ns, <span class="kw">struct</span> spdk_nvme_qpair *qpair, <span class="dt">void</span> *payload,</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true"></a>  <span class="dt">uint64_t</span> lba, <span class="dt">uint32_t</span> lba_count, spdk_nvme_cmd_cb cb_fn,</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true"></a>  <span class="dt">void</span> *cb_arg, <span class="dt">uint32_t</span> io_flags);</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true"></a></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true"></a><span class="co">// lib/nvme/nvme_ns_cmd.c</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true"></a><span class="dt">int</span> spdk_nvme_ns_cmd_read(<span class="kw">struct</span> spdk_nvme_ns *ns,</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true"></a>                          <span class="kw">struct</span> spdk_nvme_qpair *qpair, <span class="dt">void</span> *buffer,</span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true"></a>                          <span class="dt">uint64_t</span> lba, <span class="dt">uint32_t</span> lba_count,</span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true"></a>                          spdk_nvme_cmd_cb cb_fn, <span class="dt">void</span> *cb_arg,</span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true"></a>                          <span class="dt">uint32_t</span> io_flags) {</span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_request *req;</span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_payload payload;</span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true"></a></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true"></a>  payload.type = NVME_PAYLOAD_TYPE_CONTIG;</span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true"></a>  payload.u.contig = buffer;</span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true"></a>  payload.md = NULL;</span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true"></a></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true"></a>  req = _nvme_ns_cmd_rw(ns, qpair, &amp;payload, <span class="dv">0</span>, <span class="dv">0</span>, lba, lba_count, cb_fn,</span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true"></a>                        cb_arg, SPDK_NVME_OPC_READ, io_flags, <span class="dv">0</span>, <span class="dv">0</span>, <span class="kw">true</span>);</span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true"></a>  <span class="cf">if</span> (req != NULL) {</span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true"></a>    <span class="cf">return</span> nvme_qpair_submit_request(qpair, req);</span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true"></a>  } <span class="cf">else</span> {</span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true"></a>    <span class="cf">return</span> -ENOMEM;</span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true"></a>  }</span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true"></a>}</span></code></pre></div>
+<p>Specifically, <code>_nvme_ns_cmd_rw</code> will prepare the payload, and invokes <code>nvme_allocate_request</code>, which is a slot in device submission queue. If the size of the IO request is large than the namespace’s <code>sectors_per_max_io</code>, this function will <em>split</em> the request to several child IO commands sent to the device.</p>
+<p>Now, let’s look at the <code>nvme_qpair_submit_request()</code> function. Because we are using the NVMe SSD, it will go into <code>spdk_pcie_qpair_submit_request</code>, which allocate a <code>tracker</code> from preallocated tracker list.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true"></a></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true"></a><span class="co">// lib/nvme/nvme_qpair.c</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true"></a><span class="dt">int</span> nvme_qpair_submit_request(<span class="kw">struct</span> spdk_nvme_qpair *qpair,</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true"></a>                              <span class="kw">struct</span> nvme_request *req) {</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true"></a>  <span class="co">// some handling of child requests ...</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true"></a>  <span class="cf">return</span> nvme_transport_qpair_submit_request(qpair, req);</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true"></a>}</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true"></a><span class="co">// lib/nvme/nvme_transport.c</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true"></a><span class="dt">int</span> nvme_transport_qpair_submit_request(<span class="kw">struct</span> spdk_nvme_qpair *qpair,</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true"></a>                                        <span class="kw">struct</span> nvme_request *req) {</span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true"></a>  NVME_TRANSPORT_CALL(qpair-&gt;trtype, qpair_submit_request, (qpair, req));</span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true"></a>}</span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true"></a></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true"></a><span class="pp">#define NVME_TRANSPORT_CALL</span>(trtype,<span class="pp"> </span>func_name,<span class="pp"> </span>args)<span class="pp"> </span>\</span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true"></a><span class="pp">  </span><span class="cf">do</span><span class="pp"> </span>{<span class="pp">                                               </span>\</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true"></a><span class="pp">    </span><span class="cf">switch</span><span class="pp"> </span>(trtype)<span class="pp"> </span>{<span class="pp">                                </span>\</span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true"></a><span class="pp">      </span>TRANSPORT_PCIE(func_name,<span class="pp"> </span>args)<span class="pp">                </span>\</span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true"></a><span class="pp">      </span>TRANSPORT_FABRICS_RDMA(func_name,<span class="pp"> </span>args)<span class="pp">        </span>\</span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true"></a><span class="pp">      </span>TRANSPORT_DEFAULT(trtype)<span class="pp">                      </span>\</span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true"></a><span class="pp">    </span>}<span class="pp">                                                </span>\</span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true"></a><span class="pp">    </span>SPDK_UNREACHABLE();<span class="pp">                              </span>\</span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true"></a><span class="pp">  </span>}<span class="pp"> </span><span class="cf">while</span><span class="pp"> </span>(<span class="dv">0</span>)</span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true"></a></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true"></a><span class="pp">#define TRANSPORT_PCIE</span>(func_name,<span class="pp"> </span>args)<span class="pp"> </span>\</span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true"></a><span class="pp">  </span><span class="cf">case</span><span class="pp"> </span>SPDK_NVME_TRANSPORT_PCIE:<span class="pp">        </span>\</span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true"></a><span class="pp">    </span><span class="cf">return</span><span class="pp"> </span><span class="va">nvme_pcie_</span><span class="pp">##</span>func_name<span class="pp"> </span>args;</span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true"></a></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true"></a><span class="co">// lib/nvme/nvme_pcie.c</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true"></a><span class="dt">int</span> nvme_pcie_qpair_submit_request(<span class="kw">struct</span> spdk_nvme_qpair *qpair,</span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true"></a>                                   <span class="kw">struct</span> nvme_request *req) {</span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true"></a></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true"></a>  <span class="co">// ...</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true"></a></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true"></a>  <span class="fu">tr</span> = TAILQ_FIRST(&amp;pqpair-&gt;free_tr);</span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true"></a></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true"></a>  <span class="cf">if</span> (<span class="fu">tr</span> == NULL || !pqpair-&gt;is_enabled) {</span>
+<span id="cb2-38"><a href="#cb2-38" aria-hidden="true"></a>    <span class="co">/*</span></span>
+<span id="cb2-39"><a href="#cb2-39" aria-hidden="true"></a><span class="co">     * No tracker is available, or the qpair is disabled due to</span></span>
+<span id="cb2-40"><a href="#cb2-40" aria-hidden="true"></a><span class="co">     *  an in-progress controller-level reset.</span></span>
+<span id="cb2-41"><a href="#cb2-41" aria-hidden="true"></a><span class="co">     *</span></span>
+<span id="cb2-42"><a href="#cb2-42" aria-hidden="true"></a><span class="co">     * Put the request on the qpair's request queue to be</span></span>
+<span id="cb2-43"><a href="#cb2-43" aria-hidden="true"></a><span class="co">     *  processed when a tracker frees up via a command</span></span>
+<span id="cb2-44"><a href="#cb2-44" aria-hidden="true"></a><span class="co">     *  completion or when the controller reset is</span></span>
+<span id="cb2-45"><a href="#cb2-45" aria-hidden="true"></a><span class="co">     *  completed.</span></span>
+<span id="cb2-46"><a href="#cb2-46" aria-hidden="true"></a><span class="co">     */</span></span>
+<span id="cb2-47"><a href="#cb2-47" aria-hidden="true"></a>    STAILQ_INSERT_TAIL(&amp;qpair-&gt;queued_req, req, stailq);</span>
+<span id="cb2-48"><a href="#cb2-48" aria-hidden="true"></a>    <span class="cf">goto</span> exit;</span>
+<span id="cb2-49"><a href="#cb2-49" aria-hidden="true"></a>  }</span>
+<span id="cb2-50"><a href="#cb2-50" aria-hidden="true"></a></span>
+<span id="cb2-51"><a href="#cb2-51" aria-hidden="true"></a>  <span class="cf">if</span> (<span class="fu">tr</span> == NULL || !pqpair-&gt;is_enabled) {</span>
+<span id="cb2-52"><a href="#cb2-52" aria-hidden="true"></a>    <span class="co">/*</span></span>
+<span id="cb2-53"><a href="#cb2-53" aria-hidden="true"></a><span class="co">     * No tracker is available, or the qpair is disabled due to</span></span>
+<span id="cb2-54"><a href="#cb2-54" aria-hidden="true"></a><span class="co">     *  an in-progress controller-level reset.</span></span>
+<span id="cb2-55"><a href="#cb2-55" aria-hidden="true"></a><span class="co">     *</span></span>
+<span id="cb2-56"><a href="#cb2-56" aria-hidden="true"></a><span class="co">     * Put the request on the qpair's request queue to be</span></span>
+<span id="cb2-57"><a href="#cb2-57" aria-hidden="true"></a><span class="co">     *  processed when a tracker frees up via a command</span></span>
+<span id="cb2-58"><a href="#cb2-58" aria-hidden="true"></a><span class="co">     *  completion or when the controller reset is</span></span>
+<span id="cb2-59"><a href="#cb2-59" aria-hidden="true"></a><span class="co">     *  completed.</span></span>
+<span id="cb2-60"><a href="#cb2-60" aria-hidden="true"></a><span class="co">     */</span></span>
+<span id="cb2-61"><a href="#cb2-61" aria-hidden="true"></a>    STAILQ_INSERT_TAIL(&amp;qpair-&gt;queued_req, req, stailq);</span>
+<span id="cb2-62"><a href="#cb2-62" aria-hidden="true"></a>    <span class="cf">goto</span> exit;</span>
+<span id="cb2-63"><a href="#cb2-63" aria-hidden="true"></a>  }</span>
+<span id="cb2-64"><a href="#cb2-64" aria-hidden="true"></a>  TAILQ_REMOVE(&amp;pqpair-&gt;free_tr, <span class="fu">tr</span>, tq_list); <span class="co">/* remove tr from free_tr */</span></span>
+<span id="cb2-65"><a href="#cb2-65" aria-hidden="true"></a>  TAILQ_INSERT_TAIL(&amp;pqpair-&gt;outstanding_tr, <span class="fu">tr</span>, tq_list);</span>
+<span id="cb2-66"><a href="#cb2-66" aria-hidden="true"></a>  <span class="fu">tr</span>-&gt;req = req;</span>
+<span id="cb2-67"><a href="#cb2-67" aria-hidden="true"></a>  req-&gt;cmd.cid = <span class="fu">tr</span>-&gt;cid;</span>
+<span id="cb2-68"><a href="#cb2-68" aria-hidden="true"></a></span>
+<span id="cb2-69"><a href="#cb2-69" aria-hidden="true"></a>  <span class="cf">if</span> (req-&gt;payload_size &amp;&amp; req-&gt;payload.md) {</span>
+<span id="cb2-70"><a href="#cb2-70" aria-hidden="true"></a>    md_payload = req-&gt;payload.md + req-&gt;md_offset;</span>
+<span id="cb2-71"><a href="#cb2-71" aria-hidden="true"></a>    <span class="co">// mptr is: metadata pointer</span></span>
+<span id="cb2-72"><a href="#cb2-72" aria-hidden="true"></a>    <span class="fu">tr</span>-&gt;req-&gt;cmd.mptr = spdk_vtophys(md_payload);</span>
+<span id="cb2-73"><a href="#cb2-73" aria-hidden="true"></a>    <span class="cf">if</span> (<span class="fu">tr</span>-&gt;req-&gt;cmd.mptr == SPDK_VTOPHYS_ERROR) {</span>
+<span id="cb2-74"><a href="#cb2-74" aria-hidden="true"></a>      nvme_pcie_fail_request_bad_vtophys(qpair, <span class="fu">tr</span>);</span>
+<span id="cb2-75"><a href="#cb2-75" aria-hidden="true"></a>      rc = -EINVAL;</span>
+<span id="cb2-76"><a href="#cb2-76" aria-hidden="true"></a>      <span class="cf">goto</span> exit;</span>
+<span id="cb2-77"><a href="#cb2-77" aria-hidden="true"></a>    }</span>
+<span id="cb2-78"><a href="#cb2-78" aria-hidden="true"></a>  }</span>
+<span id="cb2-79"><a href="#cb2-79" aria-hidden="true"></a></span>
+<span id="cb2-80"><a href="#cb2-80" aria-hidden="true"></a>  <span class="co">// some SGL request processing</span></span>
+<span id="cb2-81"><a href="#cb2-81" aria-hidden="true"></a></span>
+<span id="cb2-82"><a href="#cb2-82" aria-hidden="true"></a>  nvme_pcie_qpair_submit_tracker(qpair, <span class="fu">tr</span>);</span>
+<span id="cb2-83"><a href="#cb2-83" aria-hidden="true"></a></span>
+<span id="cb2-84"><a href="#cb2-84" aria-hidden="true"></a>  <span class="co">// ...</span></span>
+<span id="cb2-85"><a href="#cb2-85" aria-hidden="true"></a>  <span class="cf">return</span> rc;</span>
+<span id="cb2-86"><a href="#cb2-86" aria-hidden="true"></a>}</span>
+<span id="cb2-87"><a href="#cb2-87" aria-hidden="true"></a></span>
+<span id="cb2-88"><a href="#cb2-88" aria-hidden="true"></a><span class="at">static</span> <span class="dt">void</span> nvme_pcie_qpair_submit_tracker(<span class="kw">struct</span> spdk_nvme_qpair *qpair,</span>
+<span id="cb2-89"><a href="#cb2-89" aria-hidden="true"></a>                                           <span class="kw">struct</span> nvme_tracker *<span class="fu">tr</span>) {</span>
+<span id="cb2-90"><a href="#cb2-90" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_request *req;</span>
+<span id="cb2-91"><a href="#cb2-91" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);</span>
+<span id="cb2-92"><a href="#cb2-92" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_pcie_ctrlr *pctrlr = nvme_pcie_ctrlr(qpair-&gt;ctrlr);</span>
+<span id="cb2-93"><a href="#cb2-93" aria-hidden="true"></a></span>
+<span id="cb2-94"><a href="#cb2-94" aria-hidden="true"></a>  <span class="fu">tr</span>-&gt;timed_out = <span class="dv">0</span>;</span>
+<span id="cb2-95"><a href="#cb2-95" aria-hidden="true"></a>  <span class="cf">if</span> (spdk_unlikely(qpair-&gt;active_proc &amp;&amp;</span>
+<span id="cb2-96"><a href="#cb2-96" aria-hidden="true"></a>                    qpair-&gt;active_proc-&gt;timeout_cb_fn != NULL)) {</span>
+<span id="cb2-97"><a href="#cb2-97" aria-hidden="true"></a>    <span class="co">// </span><span class="al">NOTE</span><span class="co">: here it does not invoke get_ticks() everytime in hot path</span></span>
+<span id="cb2-98"><a href="#cb2-98" aria-hidden="true"></a>    <span class="fu">tr</span>-&gt;submit_tick = spdk_get_ticks();</span>
+<span id="cb2-99"><a href="#cb2-99" aria-hidden="true"></a>  }</span>
+<span id="cb2-100"><a href="#cb2-100" aria-hidden="true"></a></span>
+<span id="cb2-101"><a href="#cb2-101" aria-hidden="true"></a>  req = <span class="fu">tr</span>-&gt;req;</span>
+<span id="cb2-102"><a href="#cb2-102" aria-hidden="true"></a>  pqpair-&gt;<span class="fu">tr</span>[<span class="fu">tr</span>-&gt;cid].active = <span class="kw">true</span>;</span>
+<span id="cb2-103"><a href="#cb2-103" aria-hidden="true"></a></span>
+<span id="cb2-104"><a href="#cb2-104" aria-hidden="true"></a>  <span class="co">/* Copy the command from the tracker to the submission queue. */</span></span>
+<span id="cb2-105"><a href="#cb2-105" aria-hidden="true"></a>  nvme_pcie_copy_command(&amp;pqpair-&gt;cmd[pqpair-&gt;sq_tail], &amp;req-&gt;cmd);</span>
+<span id="cb2-106"><a href="#cb2-106" aria-hidden="true"></a></span>
+<span id="cb2-107"><a href="#cb2-107" aria-hidden="true"></a>  <span class="cf">if</span> (++pqpair-&gt;sq_tail == pqpair-&gt;num_entries) {</span>
+<span id="cb2-108"><a href="#cb2-108" aria-hidden="true"></a>    pqpair-&gt;sq_tail = <span class="dv">0</span>;</span>
+<span id="cb2-109"><a href="#cb2-109" aria-hidden="true"></a>  }</span>
+<span id="cb2-110"><a href="#cb2-110" aria-hidden="true"></a></span>
+<span id="cb2-111"><a href="#cb2-111" aria-hidden="true"></a>  <span class="cf">if</span> (pqpair-&gt;sq_tail == pqpair-&gt;sq_head) {</span>
+<span id="cb2-112"><a href="#cb2-112" aria-hidden="true"></a>    SPDK_ERRLOG(<span class="st">&quot;sq_tail is passing sq_head!</span><span class="sc">\n</span><span class="st">&quot;</span>);</span>
+<span id="cb2-113"><a href="#cb2-113" aria-hidden="true"></a>  }</span>
+<span id="cb2-114"><a href="#cb2-114" aria-hidden="true"></a></span>
+<span id="cb2-115"><a href="#cb2-115" aria-hidden="true"></a>  <span class="co">/** Write memory barrier */</span></span>
+<span id="cb2-116"><a href="#cb2-116" aria-hidden="true"></a>  <span class="co">// in x86_64, it is using write_barrier (not full read/write barrier)</span></span>
+<span id="cb2-117"><a href="#cb2-117" aria-hidden="true"></a>  <span class="co">// #define spdk_wmb()	__asm volatile(&quot;sfence&quot; ::: &quot;memory&quot;)</span></span>
+<span id="cb2-118"><a href="#cb2-118" aria-hidden="true"></a>  <span class="co">// but not __asm volatile(&quot;mfence&quot; ::: &quot;memory&quot;)</span></span>
+<span id="cb2-119"><a href="#cb2-119" aria-hidden="true"></a>  spdk_wmb();</span>
+<span id="cb2-120"><a href="#cb2-120" aria-hidden="true"></a>  <span class="va">g_thread_mmio_ctrlr</span> = pctrlr;</span>
+<span id="cb2-121"><a href="#cb2-121" aria-hidden="true"></a>  <span class="cf">if</span> (spdk_likely(nvme_pcie_qpair_update_mmio_required(qpair, pqpair-&gt;sq_tail,</span>
+<span id="cb2-122"><a href="#cb2-122" aria-hidden="true"></a>                                                       pqpair-&gt;sq_shadow_tdbl,</span>
+<span id="cb2-123"><a href="#cb2-123" aria-hidden="true"></a>                                                       pqpair-&gt;sq_eventidx))) {</span>
+<span id="cb2-124"><a href="#cb2-124" aria-hidden="true"></a>    <span class="co">// sq_tdbl: Submission queue tail doorbell</span></span>
+<span id="cb2-125"><a href="#cb2-125" aria-hidden="true"></a>    spdk_mmio_write_4(pqpair-&gt;sq_tdbl, pqpair-&gt;sq_tail);</span>
+<span id="cb2-126"><a href="#cb2-126" aria-hidden="true"></a>  }</span>
+<span id="cb2-127"><a href="#cb2-127" aria-hidden="true"></a>  <span class="va">g_thread_mmio_ctrlr</span> = NULL;</span>
+<span id="cb2-128"><a href="#cb2-128" aria-hidden="true"></a>}</span>
+<span id="cb2-129"><a href="#cb2-129" aria-hidden="true"></a></span>
+<span id="cb2-130"><a href="#cb2-130" aria-hidden="true"></a><span class="at">static</span> <span class="kw">inline</span> <span class="dt">void</span> spdk_mmio_write_4(<span class="at">volatile</span> <span class="dt">uint32_t</span> *addr, <span class="dt">uint32_t</span> val) {</span>
+<span id="cb2-131"><a href="#cb2-131" aria-hidden="true"></a>  <span class="co">/** Compiler memory barrier */</span></span>
+<span id="cb2-132"><a href="#cb2-132" aria-hidden="true"></a>  <span class="co">// #define spdk_compiler_barrier() __asm volatile(&quot;&quot; ::: &quot;memory&quot;)</span></span>
+<span id="cb2-133"><a href="#cb2-133" aria-hidden="true"></a>  spdk_compiler_barrier();</span>
+<span id="cb2-134"><a href="#cb2-134" aria-hidden="true"></a>  *addr = val;</span>
+<span id="cb2-135"><a href="#cb2-135" aria-hidden="true"></a>}</span></code></pre></div>
+<p>The <code>spdk_nvme_tracker</code> is defined as:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true"></a><span class="kw">struct</span> nvme_tracker {</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true"></a>  TAILQ_ENTRY(nvme_tracker) tq_list;</span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_request *req;</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true"></a>  <span class="dt">uint16_t</span> cid;</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true"></a>  <span class="dt">uint16_t</span> rsvd1 : <span class="dv">14</span>;</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true"></a>  <span class="dt">uint16_t</span> timed_out : <span class="dv">1</span>;</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true"></a>  <span class="dt">uint16_t</span> active : <span class="dv">1</span>;</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true"></a></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true"></a>  <span class="dt">uint32_t</span> rsvd2;</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true"></a></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true"></a>  <span class="co">/* The value of spdk_get_ticks() when the tracker was submitted to the</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true"></a><span class="co">   * hardware. */</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true"></a>  <span class="dt">uint64_t</span> submit_tick;</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true"></a>  <span class="dt">uint64_t</span> prp_sgl_bus_addr;</span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true"></a></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true"></a>  <span class="kw">union</span> {</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true"></a>    <span class="dt">uint64_t</span> prp[NVME_MAX_PRP_LIST_ENTRIES];</span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true"></a>    <span class="kw">struct</span> spdk_nvme_sgl_descriptor sgl[NVME_MAX_SGL_DESCRIPTORS];</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true"></a>  } u;</span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true"></a>};</span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true"></a><span class="co">/*</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true"></a><span class="co"> * struct nvme_tracker must be exactly 4K so that the prp[] array does not cross</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true"></a><span class="co"> * a page boundary and so that there is no padding required to meet alignment</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true"></a><span class="co"> * requirements.</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true"></a><span class="co"> */</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true"></a>SPDK_STATIC_ASSERT(<span class="kw">sizeof</span>(<span class="kw">struct</span> nvme_tracker) == <span class="dv">4096</span>,</span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true"></a>                   <span class="st">&quot;nvme_tracker is not 4K&quot;</span>);</span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true"></a>SPDK_STATIC_ASSERT((offsetof(<span class="kw">struct</span> nvme_tracker, u.sgl) &amp; <span class="dv">7</span>) == <span class="dv">0</span>,</span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true"></a>                   <span class="st">&quot;SGL must be Qword aligned&quot;</span>);</span></code></pre></div>
+<p>[1] mentions that Each I/O has 3 data structure associated with it:</p>
+<ul>
+<li><code>struct perf_task</code> - A data structure which contains the callback that user supplies.</li>
+<li><code>struct nvme_request</code> - transport-agnostic data structure created by the NVMe driver for each I/O. It has three cache lines that are touched in the main I/O path.</li>
+<li><code>struct nvme_tracker</code> - This is a data structure created by NVMe driver’s PCIe transport for each I/O. It has one cache line that is touched in the main I/O path.</li>
+</ul>
+<div class="sourceCode" id="cb4"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true"></a><span class="kw">struct</span> nvme_request {</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true"></a>  <span class="kw">struct</span> spdk_nvme_cmd cmd;</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true"></a><span class="co">   * Data payload for this request's command.</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_payload payload;</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true"></a>  <span class="dt">uint8_t</span> retries;</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true"></a></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true"></a><span class="co">   * Number of children requests still outstanding for this</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true"></a><span class="co">   *  request which was split into multiple child requests.</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true"></a>  <span class="dt">uint16_t</span> num_children;</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true"></a>  <span class="dt">uint32_t</span> payload_size;</span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true"></a><span class="co">   * Offset in bytes from the beginning of payload for this request.</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true"></a><span class="co">   * This is used for I/O commands that are split into multiple requests.</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true"></a>  <span class="dt">uint32_t</span> payload_offset;</span>
+<span id="cb4-23"><a href="#cb4-23" aria-hidden="true"></a>  <span class="dt">uint32_t</span> md_offset;</span>
+<span id="cb4-24"><a href="#cb4-24" aria-hidden="true"></a></span>
+<span id="cb4-25"><a href="#cb4-25" aria-hidden="true"></a>  spdk_nvme_cmd_cb cb_fn;</span>
+<span id="cb4-26"><a href="#cb4-26" aria-hidden="true"></a>  <span class="dt">void</span> *cb_arg;</span>
+<span id="cb4-27"><a href="#cb4-27" aria-hidden="true"></a>  STAILQ_ENTRY(nvme_request) stailq;</span>
+<span id="cb4-28"><a href="#cb4-28" aria-hidden="true"></a></span>
+<span id="cb4-29"><a href="#cb4-29" aria-hidden="true"></a>  <span class="kw">struct</span> spdk_nvme_qpair *qpair;</span>
+<span id="cb4-30"><a href="#cb4-30" aria-hidden="true"></a></span>
+<span id="cb4-31"><a href="#cb4-31" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-32"><a href="#cb4-32" aria-hidden="true"></a><span class="co">   * The active admin request can be moved to a per process pending</span></span>
+<span id="cb4-33"><a href="#cb4-33" aria-hidden="true"></a><span class="co">   *  list based on the saved pid to tell which process it belongs</span></span>
+<span id="cb4-34"><a href="#cb4-34" aria-hidden="true"></a><span class="co">   *  to. The cpl saves the original completion information which</span></span>
+<span id="cb4-35"><a href="#cb4-35" aria-hidden="true"></a><span class="co">   *  is used in the completion callback.</span></span>
+<span id="cb4-36"><a href="#cb4-36" aria-hidden="true"></a><span class="co">   *  these below two fields are only used for admin request.</span></span>
+<span id="cb4-37"><a href="#cb4-37" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-38"><a href="#cb4-38" aria-hidden="true"></a>  <span class="dt">pid_t</span> pid;</span>
+<span id="cb4-39"><a href="#cb4-39" aria-hidden="true"></a>  <span class="kw">struct</span> spdk_nvme_cpl cpl;</span>
+<span id="cb4-40"><a href="#cb4-40" aria-hidden="true"></a></span>
+<span id="cb4-41"><a href="#cb4-41" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-42"><a href="#cb4-42" aria-hidden="true"></a><span class="co">   * The following members should not be reordered with members</span></span>
+<span id="cb4-43"><a href="#cb4-43" aria-hidden="true"></a><span class="co">   *  above.  These members are only needed when splitting</span></span>
+<span id="cb4-44"><a href="#cb4-44" aria-hidden="true"></a><span class="co">   *  requests which is done rarely, and the driver is careful</span></span>
+<span id="cb4-45"><a href="#cb4-45" aria-hidden="true"></a><span class="co">   *  to not touch the following fields until a split operation is</span></span>
+<span id="cb4-46"><a href="#cb4-46" aria-hidden="true"></a><span class="co">   *  needed, to avoid touching an extra cacheline.</span></span>
+<span id="cb4-47"><a href="#cb4-47" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-48"><a href="#cb4-48" aria-hidden="true"></a></span>
+<span id="cb4-49"><a href="#cb4-49" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-50"><a href="#cb4-50" aria-hidden="true"></a><span class="co">   * Points to the outstanding child requests for a parent request.</span></span>
+<span id="cb4-51"><a href="#cb4-51" aria-hidden="true"></a><span class="co">   *  Only valid if a request was split into multiple children</span></span>
+<span id="cb4-52"><a href="#cb4-52" aria-hidden="true"></a><span class="co">   *  requests, and is not initialized for non-split requests.</span></span>
+<span id="cb4-53"><a href="#cb4-53" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-54"><a href="#cb4-54" aria-hidden="true"></a>  TAILQ_HEAD(, nvme_request) children;</span>
+<span id="cb4-55"><a href="#cb4-55" aria-hidden="true"></a></span>
+<span id="cb4-56"><a href="#cb4-56" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-57"><a href="#cb4-57" aria-hidden="true"></a><span class="co">   * Linked-list pointers for a child request in its parent's list.</span></span>
+<span id="cb4-58"><a href="#cb4-58" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-59"><a href="#cb4-59" aria-hidden="true"></a>  TAILQ_ENTRY(nvme_request) child_tailq;</span>
+<span id="cb4-60"><a href="#cb4-60" aria-hidden="true"></a></span>
+<span id="cb4-61"><a href="#cb4-61" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-62"><a href="#cb4-62" aria-hidden="true"></a><span class="co">   * Points to a parent request if part of a split request,</span></span>
+<span id="cb4-63"><a href="#cb4-63" aria-hidden="true"></a><span class="co">   *   NULL otherwise.</span></span>
+<span id="cb4-64"><a href="#cb4-64" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-65"><a href="#cb4-65" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_request *parent;</span>
+<span id="cb4-66"><a href="#cb4-66" aria-hidden="true"></a></span>
+<span id="cb4-67"><a href="#cb4-67" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-68"><a href="#cb4-68" aria-hidden="true"></a><span class="co">   * Completion status for a parent request.  Initialized to all 0's</span></span>
+<span id="cb4-69"><a href="#cb4-69" aria-hidden="true"></a><span class="co">   *  (SUCCESS) before child requests are submitted.  If a child</span></span>
+<span id="cb4-70"><a href="#cb4-70" aria-hidden="true"></a><span class="co">   *  request completes with error, the error status is copied here,</span></span>
+<span id="cb4-71"><a href="#cb4-71" aria-hidden="true"></a><span class="co">   *  to ensure that the parent request is also completed with error</span></span>
+<span id="cb4-72"><a href="#cb4-72" aria-hidden="true"></a><span class="co">   *  status once all child requests are completed.</span></span>
+<span id="cb4-73"><a href="#cb4-73" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-74"><a href="#cb4-74" aria-hidden="true"></a>  <span class="kw">struct</span> spdk_nvme_cpl parent_status;</span>
+<span id="cb4-75"><a href="#cb4-75" aria-hidden="true"></a></span>
+<span id="cb4-76"><a href="#cb4-76" aria-hidden="true"></a>  <span class="co">/**</span></span>
+<span id="cb4-77"><a href="#cb4-77" aria-hidden="true"></a><span class="co">   * The user_cb_fn and user_cb_arg fields are used for holding the original</span></span>
+<span id="cb4-78"><a href="#cb4-78" aria-hidden="true"></a><span class="co">   * callback data when using nvme_allocate_request_user_copy.</span></span>
+<span id="cb4-79"><a href="#cb4-79" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb4-80"><a href="#cb4-80" aria-hidden="true"></a>  spdk_nvme_cmd_cb user_cb_fn;</span>
+<span id="cb4-81"><a href="#cb4-81" aria-hidden="true"></a>  <span class="dt">void</span> *user_cb_arg;</span>
+<span id="cb4-82"><a href="#cb4-82" aria-hidden="true"></a>  <span class="dt">void</span> *user_buffer;</span>
+<span id="cb4-83"><a href="#cb4-83" aria-hidden="true"></a>};</span>
+<span id="cb4-84"><a href="#cb4-84" aria-hidden="true"></a></span>
+<span id="cb4-85"><a href="#cb4-85" aria-hidden="true"></a><span class="co">// qpair's submission queue is actually array of spdk_nvme_cmd</span></span>
+<span id="cb4-86"><a href="#cb4-86" aria-hidden="true"></a><span class="kw">struct</span> spdk_nvme_cmd {</span>
+<span id="cb4-87"><a href="#cb4-87" aria-hidden="true"></a>  <span class="co">/* dword 0 */</span></span>
+<span id="cb4-88"><a href="#cb4-88" aria-hidden="true"></a>  <span class="dt">uint16_t</span> opc : <span class="dv">8</span>;  <span class="co">/* opcode */</span></span>
+<span id="cb4-89"><a href="#cb4-89" aria-hidden="true"></a>  <span class="dt">uint16_t</span> fuse : <span class="dv">2</span>; <span class="co">/* fused operation */</span></span>
+<span id="cb4-90"><a href="#cb4-90" aria-hidden="true"></a>  <span class="dt">uint16_t</span> rsvd1 : <span class="dv">4</span>;</span>
+<span id="cb4-91"><a href="#cb4-91" aria-hidden="true"></a>  <span class="dt">uint16_t</span> psdt : <span class="dv">2</span>;</span>
+<span id="cb4-92"><a href="#cb4-92" aria-hidden="true"></a>  <span class="dt">uint16_t</span> cid; <span class="co">/* command identifier */</span></span>
+<span id="cb4-93"><a href="#cb4-93" aria-hidden="true"></a></span>
+<span id="cb4-94"><a href="#cb4-94" aria-hidden="true"></a>  <span class="co">/* dword 1 */</span></span>
+<span id="cb4-95"><a href="#cb4-95" aria-hidden="true"></a>  <span class="dt">uint32_t</span> nsid; <span class="co">/* namespace identifier */</span></span>
+<span id="cb4-96"><a href="#cb4-96" aria-hidden="true"></a></span>
+<span id="cb4-97"><a href="#cb4-97" aria-hidden="true"></a>  <span class="co">/* dword 2-3 */</span></span>
+<span id="cb4-98"><a href="#cb4-98" aria-hidden="true"></a>  <span class="dt">uint32_t</span> rsvd2;</span>
+<span id="cb4-99"><a href="#cb4-99" aria-hidden="true"></a>  <span class="dt">uint32_t</span> rsvd3;</span>
+<span id="cb4-100"><a href="#cb4-100" aria-hidden="true"></a></span>
+<span id="cb4-101"><a href="#cb4-101" aria-hidden="true"></a>  <span class="co">/* dword 4-5 */</span></span>
+<span id="cb4-102"><a href="#cb4-102" aria-hidden="true"></a>  <span class="dt">uint64_t</span> mptr; <span class="co">/* metadata pointer */</span></span>
+<span id="cb4-103"><a href="#cb4-103" aria-hidden="true"></a></span>
+<span id="cb4-104"><a href="#cb4-104" aria-hidden="true"></a>  <span class="co">/* dword 6-9: data pointer */</span></span>
+<span id="cb4-105"><a href="#cb4-105" aria-hidden="true"></a>  <span class="kw">union</span> {</span>
+<span id="cb4-106"><a href="#cb4-106" aria-hidden="true"></a>    <span class="kw">struct</span> {</span>
+<span id="cb4-107"><a href="#cb4-107" aria-hidden="true"></a>      <span class="dt">uint64_t</span> prp1; <span class="co">/* prp entry 1 */</span></span>
+<span id="cb4-108"><a href="#cb4-108" aria-hidden="true"></a>      <span class="dt">uint64_t</span> prp2; <span class="co">/* prp entry 2 */</span></span>
+<span id="cb4-109"><a href="#cb4-109" aria-hidden="true"></a>    } prp;</span>
+<span id="cb4-110"><a href="#cb4-110" aria-hidden="true"></a></span>
+<span id="cb4-111"><a href="#cb4-111" aria-hidden="true"></a>    <span class="kw">struct</span> spdk_nvme_sgl_descriptor sgl1;</span>
+<span id="cb4-112"><a href="#cb4-112" aria-hidden="true"></a>  } dptr;</span>
+<span id="cb4-113"><a href="#cb4-113" aria-hidden="true"></a></span>
+<span id="cb4-114"><a href="#cb4-114" aria-hidden="true"></a>  <span class="co">/* dword 10-15 */</span></span>
+<span id="cb4-115"><a href="#cb4-115" aria-hidden="true"></a>  <span class="dt">uint32_t</span> cdw10; <span class="co">/* command-specific */</span></span>
+<span id="cb4-116"><a href="#cb4-116" aria-hidden="true"></a>  <span class="dt">uint32_t</span> cdw11; <span class="co">/* command-specific */</span></span>
+<span id="cb4-117"><a href="#cb4-117" aria-hidden="true"></a>  <span class="dt">uint32_t</span> cdw12; <span class="co">/* command-specific */</span></span>
+<span id="cb4-118"><a href="#cb4-118" aria-hidden="true"></a>  <span class="dt">uint32_t</span> cdw13; <span class="co">/* command-specific */</span></span>
+<span id="cb4-119"><a href="#cb4-119" aria-hidden="true"></a>  <span class="dt">uint32_t</span> cdw14; <span class="co">/* command-specific */</span></span>
+<span id="cb4-120"><a href="#cb4-120" aria-hidden="true"></a>  <span class="dt">uint32_t</span> cdw15; <span class="co">/* command-specific */</span></span>
+<span id="cb4-121"><a href="#cb4-121" aria-hidden="true"></a>};</span></code></pre></div>
+<h3 id="io-completion-polling">IO Completion Polling</h3>
+<p>Now, let’s look at the completion polling path. The main processing of completion is in <code>nvme_pcie_qpair_process_completions</code>. By default, it will walk through the completion queue entries in an NVMe queue pair’s completion queue and checks for entries whose phase bit has flipper. (See <code>while(1)</code> part). For each entry found, we need to update the completion queue head doorbell.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true"></a></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true"></a><span class="co">// lib/nvme/nvme_qpair.c</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true"></a><span class="dt">int32_t</span> spdk_nvme_qpair_process_completions(<span class="kw">struct</span> spdk_nvme_qpair *qpair,</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true"></a>                                            <span class="dt">uint32_t</span> max_completions) {</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true"></a>  <span class="dt">int32_t</span> ret;</span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true"></a>  <span class="cf">if</span> (qpair-&gt;ctrlr-&gt;is_failed) {</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true"></a>    nvme_qpair_fail(qpair);</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true"></a>    <span class="cf">return</span> <span class="dv">0</span>;</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true"></a>  }</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true"></a></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true"></a>  qpair-&gt;in_completion_context = <span class="dv">1</span>;</span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true"></a>  ret = nvme_transport_qpair_process_completions(qpair, max_completions);</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true"></a>  qpair-&gt;in_completion_context = <span class="dv">0</span>;</span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true"></a>  <span class="cf">if</span> (qpair-&gt;delete_after_completion_context) {</span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true"></a>    <span class="co">/*</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true"></a><span class="co">     * A request to delete this qpair was made in the context of this completion</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true"></a><span class="co">     *  routine - so it is safe to delete it now.</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true"></a><span class="co">     */</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true"></a>    spdk_nvme_ctrlr_free_io_qpair(qpair);</span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true"></a>  }</span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true"></a>  <span class="cf">return</span> ret;</span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true"></a>}</span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true"></a></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true"></a><span class="co">// lib/nvme/nvme_pcie.c</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true"></a><span class="dt">int32_t</span> nvme_pcie_qpair_process_completions(<span class="kw">struct</span> spdk_nvme_qpair *qpair,</span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true"></a>                                            <span class="dt">uint32_t</span> max_completions) {</span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);</span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_pcie_ctrlr *pctrlr = nvme_pcie_ctrlr(qpair-&gt;ctrlr);</span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_tracker *<span class="fu">tr</span>;</span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true"></a>  <span class="kw">struct</span> spdk_nvme_cpl *cpl;</span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true"></a>  <span class="dt">uint32_t</span> num_completions = <span class="dv">0</span>;</span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true"></a>  <span class="kw">struct</span> spdk_nvme_ctrlr *ctrlr = qpair-&gt;ctrlr;</span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true"></a></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true"></a>  <span class="cf">if</span> (spdk_unlikely(!nvme_pcie_qpair_check_enabled(qpair))) {</span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true"></a>    <span class="co">/*</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true"></a><span class="co">     * qpair is not enabled, likely because a controller reset is</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true"></a><span class="co">     *  is in progress.  Ignore the interrupt - any I/O that was</span></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true"></a><span class="co">     *  associated with this interrupt will get retried when the</span></span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true"></a><span class="co">     *  reset is complete.</span></span>
+<span id="cb5-41"><a href="#cb5-41" aria-hidden="true"></a><span class="co">     */</span></span>
+<span id="cb5-42"><a href="#cb5-42" aria-hidden="true"></a>    <span class="cf">return</span> <span class="dv">0</span>;</span>
+<span id="cb5-43"><a href="#cb5-43" aria-hidden="true"></a>  }</span>
+<span id="cb5-44"><a href="#cb5-44" aria-hidden="true"></a></span>
+<span id="cb5-45"><a href="#cb5-45" aria-hidden="true"></a>  <span class="cf">if</span> (spdk_unlikely(nvme_qpair_is_admin_queue(qpair))) {</span>
+<span id="cb5-46"><a href="#cb5-46" aria-hidden="true"></a>    nvme_robust_mutex_lock(&amp;ctrlr-&gt;ctrlr_lock);</span>
+<span id="cb5-47"><a href="#cb5-47" aria-hidden="true"></a>  }</span>
+<span id="cb5-48"><a href="#cb5-48" aria-hidden="true"></a></span>
+<span id="cb5-49"><a href="#cb5-49" aria-hidden="true"></a>  <span class="cf">if</span> (max_completions == <span class="dv">0</span> || max_completions &gt; pqpair-&gt;max_completions_cap) {</span>
+<span id="cb5-50"><a href="#cb5-50" aria-hidden="true"></a>    <span class="co">/*</span></span>
+<span id="cb5-51"><a href="#cb5-51" aria-hidden="true"></a><span class="co">     * max_completions == 0 means unlimited, but complete at most</span></span>
+<span id="cb5-52"><a href="#cb5-52" aria-hidden="true"></a><span class="co">     * max_completions_cap batch of I/O at a time so that the completion</span></span>
+<span id="cb5-53"><a href="#cb5-53" aria-hidden="true"></a><span class="co">     * queue doorbells don't wrap around.</span></span>
+<span id="cb5-54"><a href="#cb5-54" aria-hidden="true"></a><span class="co">     */</span></span>
+<span id="cb5-55"><a href="#cb5-55" aria-hidden="true"></a>    max_completions = pqpair-&gt;max_completions_cap;</span>
+<span id="cb5-56"><a href="#cb5-56" aria-hidden="true"></a>  }</span>
+<span id="cb5-57"><a href="#cb5-57" aria-hidden="true"></a></span>
+<span id="cb5-58"><a href="#cb5-58" aria-hidden="true"></a>  <span class="cf">while</span> (<span class="dv">1</span>) {</span>
+<span id="cb5-59"><a href="#cb5-59" aria-hidden="true"></a>    cpl = &amp;pqpair-&gt;cpl[pqpair-&gt;cq_head];</span>
+<span id="cb5-60"><a href="#cb5-60" aria-hidden="true"></a></span>
+<span id="cb5-61"><a href="#cb5-61" aria-hidden="true"></a>    <span class="cf">if</span> (cpl-&gt;status.p != pqpair-&gt;phase) {</span>
+<span id="cb5-62"><a href="#cb5-62" aria-hidden="true"></a>      <span class="co">// check the phase bit</span></span>
+<span id="cb5-63"><a href="#cb5-63" aria-hidden="true"></a>      <span class="cf">break</span>;</span>
+<span id="cb5-64"><a href="#cb5-64" aria-hidden="true"></a>    }</span>
+<span id="cb5-65"><a href="#cb5-65" aria-hidden="true"></a></span>
+<span id="cb5-66"><a href="#cb5-66" aria-hidden="true"></a>    <span class="fu">tr</span> = &amp;pqpair-&gt;<span class="fu">tr</span>[cpl-&gt;cid];</span>
+<span id="cb5-67"><a href="#cb5-67" aria-hidden="true"></a>    pqpair-&gt;sq_head = cpl-&gt;sqhd;</span>
+<span id="cb5-68"><a href="#cb5-68" aria-hidden="true"></a></span>
+<span id="cb5-69"><a href="#cb5-69" aria-hidden="true"></a>    <span class="cf">if</span> (<span class="fu">tr</span>-&gt;active) {</span>
+<span id="cb5-70"><a href="#cb5-70" aria-hidden="true"></a>      nvme_pcie_qpair_complete_tracker(qpair, <span class="fu">tr</span>, cpl, <span class="kw">true</span>);</span>
+<span id="cb5-71"><a href="#cb5-71" aria-hidden="true"></a>    } <span class="cf">else</span> {</span>
+<span id="cb5-72"><a href="#cb5-72" aria-hidden="true"></a>      SPDK_ERRLOG(<span class="st">&quot;cpl does not map to outstanding cmd</span><span class="sc">\n</span><span class="st">&quot;</span>);</span>
+<span id="cb5-73"><a href="#cb5-73" aria-hidden="true"></a>      nvme_qpair_print_completion(qpair, cpl);</span>
+<span id="cb5-74"><a href="#cb5-74" aria-hidden="true"></a>      <span class="ot">assert</span>(<span class="dv">0</span>);</span>
+<span id="cb5-75"><a href="#cb5-75" aria-hidden="true"></a>    }</span>
+<span id="cb5-76"><a href="#cb5-76" aria-hidden="true"></a></span>
+<span id="cb5-77"><a href="#cb5-77" aria-hidden="true"></a>    <span class="cf">if</span> (spdk_unlikely(++pqpair-&gt;cq_head == pqpair-&gt;num_entries)) {</span>
+<span id="cb5-78"><a href="#cb5-78" aria-hidden="true"></a>      pqpair-&gt;cq_head = <span class="dv">0</span>;</span>
+<span id="cb5-79"><a href="#cb5-79" aria-hidden="true"></a>      pqpair-&gt;phase = !pqpair-&gt;phase;</span>
+<span id="cb5-80"><a href="#cb5-80" aria-hidden="true"></a>    }</span>
+<span id="cb5-81"><a href="#cb5-81" aria-hidden="true"></a></span>
+<span id="cb5-82"><a href="#cb5-82" aria-hidden="true"></a>    <span class="cf">if</span> (++num_completions == max_completions) {</span>
+<span id="cb5-83"><a href="#cb5-83" aria-hidden="true"></a>      <span class="cf">break</span>;</span>
+<span id="cb5-84"><a href="#cb5-84" aria-hidden="true"></a>    }</span>
+<span id="cb5-85"><a href="#cb5-85" aria-hidden="true"></a>  }</span>
+<span id="cb5-86"><a href="#cb5-86" aria-hidden="true"></a></span>
+<span id="cb5-87"><a href="#cb5-87" aria-hidden="true"></a>  <span class="cf">if</span> (num_completions &gt; <span class="dv">0</span>) {</span>
+<span id="cb5-88"><a href="#cb5-88" aria-hidden="true"></a>    <span class="va">g_thread_mmio_ctrlr</span> = pctrlr;</span>
+<span id="cb5-89"><a href="#cb5-89" aria-hidden="true"></a>    <span class="cf">if</span> (spdk_likely(nvme_pcie_qpair_update_mmio_required(</span>
+<span id="cb5-90"><a href="#cb5-90" aria-hidden="true"></a>            qpair, pqpair-&gt;cq_head, pqpair-&gt;cq_shadow_hdbl,</span>
+<span id="cb5-91"><a href="#cb5-91" aria-hidden="true"></a>            pqpair-&gt;cq_eventidx))) {</span>
+<span id="cb5-92"><a href="#cb5-92" aria-hidden="true"></a>      <span class="co">// ring the qpair's completion head doorbell</span></span>
+<span id="cb5-93"><a href="#cb5-93" aria-hidden="true"></a>      spdk_mmio_write_4(pqpair-&gt;cq_hdbl, pqpair-&gt;cq_head);</span>
+<span id="cb5-94"><a href="#cb5-94" aria-hidden="true"></a>    }</span>
+<span id="cb5-95"><a href="#cb5-95" aria-hidden="true"></a>    <span class="va">g_thread_mmio_ctrlr</span> = NULL;</span>
+<span id="cb5-96"><a href="#cb5-96" aria-hidden="true"></a>  }</span>
+<span id="cb5-97"><a href="#cb5-97" aria-hidden="true"></a></span>
+<span id="cb5-98"><a href="#cb5-98" aria-hidden="true"></a>  <span class="co">/* We don't want to expose the admin queue to the user,</span></span>
+<span id="cb5-99"><a href="#cb5-99" aria-hidden="true"></a><span class="co">   * so when we're timing out admin commands set the</span></span>
+<span id="cb5-100"><a href="#cb5-100" aria-hidden="true"></a><span class="co">   * qpair to NULL.</span></span>
+<span id="cb5-101"><a href="#cb5-101" aria-hidden="true"></a><span class="co">   */</span></span>
+<span id="cb5-102"><a href="#cb5-102" aria-hidden="true"></a>  <span class="cf">if</span> (!nvme_qpair_is_admin_queue(qpair) &amp;&amp;</span>
+<span id="cb5-103"><a href="#cb5-103" aria-hidden="true"></a>      spdk_unlikely(qpair-&gt;active_proc-&gt;timeout_cb_fn != NULL) &amp;&amp;</span>
+<span id="cb5-104"><a href="#cb5-104" aria-hidden="true"></a>      qpair-&gt;ctrlr-&gt;state == NVME_CTRLR_STATE_READY) {</span>
+<span id="cb5-105"><a href="#cb5-105" aria-hidden="true"></a>    <span class="co">/*</span></span>
+<span id="cb5-106"><a href="#cb5-106" aria-hidden="true"></a><span class="co">     * User registered for timeout callback</span></span>
+<span id="cb5-107"><a href="#cb5-107" aria-hidden="true"></a><span class="co">     */</span></span>
+<span id="cb5-108"><a href="#cb5-108" aria-hidden="true"></a>    nvme_pcie_qpair_check_timeout(qpair);</span>
+<span id="cb5-109"><a href="#cb5-109" aria-hidden="true"></a>  }</span>
+<span id="cb5-110"><a href="#cb5-110" aria-hidden="true"></a></span>
+<span id="cb5-111"><a href="#cb5-111" aria-hidden="true"></a>  <span class="co">/* Before returning, complete any pending admin request. */</span></span>
+<span id="cb5-112"><a href="#cb5-112" aria-hidden="true"></a>  <span class="cf">if</span> (spdk_unlikely(nvme_qpair_is_admin_queue(qpair))) {</span>
+<span id="cb5-113"><a href="#cb5-113" aria-hidden="true"></a>    nvme_pcie_qpair_complete_pending_admin_request(qpair);</span>
+<span id="cb5-114"><a href="#cb5-114" aria-hidden="true"></a></span>
+<span id="cb5-115"><a href="#cb5-115" aria-hidden="true"></a>    nvme_robust_mutex_unlock(&amp;ctrlr-&gt;ctrlr_lock);</span>
+<span id="cb5-116"><a href="#cb5-116" aria-hidden="true"></a>  }</span>
+<span id="cb5-117"><a href="#cb5-117" aria-hidden="true"></a></span>
+<span id="cb5-118"><a href="#cb5-118" aria-hidden="true"></a>  <span class="cf">return</span> num_completions;</span>
+<span id="cb5-119"><a href="#cb5-119" aria-hidden="true"></a>}</span>
+<span id="cb5-120"><a href="#cb5-120" aria-hidden="true"></a></span>
+<span id="cb5-121"><a href="#cb5-121" aria-hidden="true"></a><span class="co">// nvme_spec.h</span></span>
+<span id="cb5-122"><a href="#cb5-122" aria-hidden="true"></a><span class="co">// Completion queue entry</span></span>
+<span id="cb5-123"><a href="#cb5-123" aria-hidden="true"></a><span class="kw">struct</span> spdk_nvme_cpl {</span>
+<span id="cb5-124"><a href="#cb5-124" aria-hidden="true"></a>	<span class="co">/* dword 0 */</span></span>
+<span id="cb5-125"><a href="#cb5-125" aria-hidden="true"></a>	<span class="dt">uint32_t</span>		cdw0;	<span class="co">/* command-specific */</span></span>
+<span id="cb5-126"><a href="#cb5-126" aria-hidden="true"></a>	<span class="co">/* dword 1 */</span></span>
+<span id="cb5-127"><a href="#cb5-127" aria-hidden="true"></a>	<span class="dt">uint32_t</span>		rsvd1;</span>
+<span id="cb5-128"><a href="#cb5-128" aria-hidden="true"></a>	<span class="co">/* dword 2 */</span></span>
+<span id="cb5-129"><a href="#cb5-129" aria-hidden="true"></a>	<span class="dt">uint16_t</span>		sqhd;	<span class="co">/* submission queue head pointer */</span></span>
+<span id="cb5-130"><a href="#cb5-130" aria-hidden="true"></a>	<span class="dt">uint16_t</span>		sqid;	<span class="co">/* submission queue identifier */</span></span>
+<span id="cb5-131"><a href="#cb5-131" aria-hidden="true"></a>	<span class="co">/* dword 3 */</span></span>
+<span id="cb5-132"><a href="#cb5-132" aria-hidden="true"></a>	<span class="dt">uint16_t</span>		cid;	<span class="co">/* command identifier */</span></span>
+<span id="cb5-133"><a href="#cb5-133" aria-hidden="true"></a>	<span class="kw">struct</span> spdk_nvme_status	status;</span>
+<span id="cb5-134"><a href="#cb5-134" aria-hidden="true"></a>};</span>
+<span id="cb5-135"><a href="#cb5-135" aria-hidden="true"></a></span>
+<span id="cb5-136"><a href="#cb5-136" aria-hidden="true"></a><span class="co">// and the phase tag is in status</span></span>
+<span id="cb5-137"><a href="#cb5-137" aria-hidden="true"></a><span class="kw">struct</span> spdk_nvme_status {</span>
+<span id="cb5-138"><a href="#cb5-138" aria-hidden="true"></a>  <span class="dt">uint16_t</span> p : <span class="dv">1</span>;   <span class="co">/* phase tag */</span></span>
+<span id="cb5-139"><a href="#cb5-139" aria-hidden="true"></a>  <span class="dt">uint16_t</span> sc : <span class="dv">8</span>;  <span class="co">/* status code */</span></span>
+<span id="cb5-140"><a href="#cb5-140" aria-hidden="true"></a>  <span class="dt">uint16_t</span> sct : <span class="dv">3</span>; <span class="co">/* status code type */</span></span>
+<span id="cb5-141"><a href="#cb5-141" aria-hidden="true"></a>  <span class="dt">uint16_t</span> rsvd2 : <span class="dv">2</span>;</span>
+<span id="cb5-142"><a href="#cb5-142" aria-hidden="true"></a>  <span class="dt">uint16_t</span> m : <span class="dv">1</span>;   <span class="co">/* more */</span></span>
+<span id="cb5-143"><a href="#cb5-143" aria-hidden="true"></a>  <span class="dt">uint16_t</span> dnr : <span class="dv">1</span>; <span class="co">/* do not retry */</span></span>
+<span id="cb5-144"><a href="#cb5-144" aria-hidden="true"></a>};</span>
+<span id="cb5-145"><a href="#cb5-145" aria-hidden="true"></a></span>
+<span id="cb5-146"><a href="#cb5-146" aria-hidden="true"></a><span class="co">// Each qpair has its *cpl* field as completion queue</span></span>
+<span id="cb5-147"><a href="#cb5-147" aria-hidden="true"></a>pqpair-&gt;cpl =</span>
+<span id="cb5-148"><a href="#cb5-148" aria-hidden="true"></a>    spdk_dma_zmalloc(pqpair-&gt;num_entries * <span class="kw">sizeof</span>(<span class="kw">struct</span> spdk_nvme_cpl),</span>
+<span id="cb5-149"><a href="#cb5-149" aria-hidden="true"></a>                     page_size, &amp;pqpair-&gt;cpl_bus_addr)</span></code></pre></div>
+<p><code>nvme_pcie_qpair_complete_tracker</code> is the main component to process this completion. And it corresponds to the submission path’s <code>nvme_pcie_qpair_submit_tracker</code>, the definition of the function is shown bellow. The NVMe completion queue is an array of completion queue entries. Inside those entries is a CID value that SPDK provided on command submission. SPDK allocates an array of tracker objects where the index is this CID. Remember, SPDK allows users to queue up more requests than there are actual slots in the submission queue, and that NVMe allows commands to complete in any order after submission.</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode cpp"><code class="sourceCode cpp"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true"></a><span class="co">// nvme_pcie.c</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true"></a><span class="at">static</span> <span class="dt">void</span> nvme_pcie_qpair_complete_tracker(<span class="kw">struct</span> spdk_nvme_qpair *qpair,</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true"></a>                                             <span class="kw">struct</span> nvme_tracker *<span class="fu">tr</span>,</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true"></a>                                             <span class="kw">struct</span> spdk_nvme_cpl *cpl,</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true"></a>                                             <span class="dt">bool</span> print_on_error) {</span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_pcie_qpair *pqpair = nvme_pcie_qpair(qpair);</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true"></a>  <span class="kw">struct</span> nvme_request *req;</span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true"></a>  <span class="dt">bool</span> retry, error, was_active;</span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true"></a>  <span class="dt">bool</span> req_from_current_proc = <span class="kw">true</span>;</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true"></a></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true"></a>  req = <span class="fu">tr</span>-&gt;req;</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true"></a></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true"></a>  <span class="ot">assert</span>(req != NULL);</span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true"></a></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true"></a>  error = spdk_nvme_cpl_is_error(cpl);</span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true"></a>  retry = error &amp;&amp; nvme_completion_is_retry(cpl) &amp;&amp;</span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true"></a>          req-&gt;retries &lt; spdk_nvme_retry_count;</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true"></a></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true"></a>  <span class="cf">if</span> (error &amp;&amp; print_on_error) {</span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true"></a>    nvme_qpair_print_command(qpair, &amp;req-&gt;cmd);</span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true"></a>    nvme_qpair_print_completion(qpair, cpl);</span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true"></a>  }</span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true"></a></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true"></a>  was_active = pqpair-&gt;<span class="fu">tr</span>[cpl-&gt;cid].active;</span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true"></a>  pqpair-&gt;<span class="fu">tr</span>[cpl-&gt;cid].active = <span class="kw">false</span>;</span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true"></a></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true"></a>  <span class="ot">assert</span>(cpl-&gt;cid == req-&gt;cmd.cid);</span>
+<span id="cb6-28"><a href="#cb6-28" aria-hidden="true"></a></span>
+<span id="cb6-29"><a href="#cb6-29" aria-hidden="true"></a>  <span class="cf">if</span> (retry) {</span>
+<span id="cb6-30"><a href="#cb6-30" aria-hidden="true"></a>    req-&gt;retries++;</span>
+<span id="cb6-31"><a href="#cb6-31" aria-hidden="true"></a>    nvme_pcie_qpair_submit_tracker(qpair, <span class="fu">tr</span>);</span>
+<span id="cb6-32"><a href="#cb6-32" aria-hidden="true"></a>  } <span class="cf">else</span> {</span>
+<span id="cb6-33"><a href="#cb6-33" aria-hidden="true"></a>    <span class="cf">if</span> (was_active) {</span>
+<span id="cb6-34"><a href="#cb6-34" aria-hidden="true"></a>      <span class="co">/* Only check admin requests from different processes. */</span></span>
+<span id="cb6-35"><a href="#cb6-35" aria-hidden="true"></a>      <span class="cf">if</span> (nvme_qpair_is_admin_queue(qpair) &amp;&amp; req-&gt;pid != getpid()) {</span>
+<span id="cb6-36"><a href="#cb6-36" aria-hidden="true"></a>        req_from_current_proc = <span class="kw">false</span>;</span>
+<span id="cb6-37"><a href="#cb6-37" aria-hidden="true"></a>        nvme_pcie_qpair_insert_pending_admin_request(qpair, req, cpl);</span>
+<span id="cb6-38"><a href="#cb6-38" aria-hidden="true"></a>      } <span class="cf">else</span> {</span>
+<span id="cb6-39"><a href="#cb6-39" aria-hidden="true"></a>        <span class="cf">if</span> (req-&gt;cb_fn) {</span>
+<span id="cb6-40"><a href="#cb6-40" aria-hidden="true"></a>          <span class="co">// </span><span class="al">NOTE</span><span class="co">: this is the callback invocation</span></span>
+<span id="cb6-41"><a href="#cb6-41" aria-hidden="true"></a>          req-&gt;cb_fn(req-&gt;cb_arg, cpl);</span>
+<span id="cb6-42"><a href="#cb6-42" aria-hidden="true"></a>        }</span>
+<span id="cb6-43"><a href="#cb6-43" aria-hidden="true"></a>      }</span>
+<span id="cb6-44"><a href="#cb6-44" aria-hidden="true"></a>    }</span>
+<span id="cb6-45"><a href="#cb6-45" aria-hidden="true"></a></span>
+<span id="cb6-46"><a href="#cb6-46" aria-hidden="true"></a>    <span class="cf">if</span> (req_from_current_proc == <span class="kw">true</span>) {</span>
+<span id="cb6-47"><a href="#cb6-47" aria-hidden="true"></a>      nvme_free_request(req);</span>
+<span id="cb6-48"><a href="#cb6-48" aria-hidden="true"></a>    }</span>
+<span id="cb6-49"><a href="#cb6-49" aria-hidden="true"></a></span>
+<span id="cb6-50"><a href="#cb6-50" aria-hidden="true"></a>    <span class="fu">tr</span>-&gt;req = NULL;</span>
+<span id="cb6-51"><a href="#cb6-51" aria-hidden="true"></a></span>
+<span id="cb6-52"><a href="#cb6-52" aria-hidden="true"></a>    TAILQ_REMOVE(&amp;pqpair-&gt;outstanding_tr, <span class="fu">tr</span>, tq_list);</span>
+<span id="cb6-53"><a href="#cb6-53" aria-hidden="true"></a>    TAILQ_INSERT_HEAD(&amp;pqpair-&gt;free_tr, <span class="fu">tr</span>, tq_list);</span>
+<span id="cb6-54"><a href="#cb6-54" aria-hidden="true"></a></span>
+<span id="cb6-55"><a href="#cb6-55" aria-hidden="true"></a>    <span class="co">/*</span></span>
+<span id="cb6-56"><a href="#cb6-56" aria-hidden="true"></a><span class="co">     * If the controller is in the middle of resetting, don't</span></span>
+<span id="cb6-57"><a href="#cb6-57" aria-hidden="true"></a><span class="co">     *  try to submit queued requests here - let the reset logic</span></span>
+<span id="cb6-58"><a href="#cb6-58" aria-hidden="true"></a><span class="co">     *  handle that instead.</span></span>
+<span id="cb6-59"><a href="#cb6-59" aria-hidden="true"></a><span class="co">     */</span></span>
+<span id="cb6-60"><a href="#cb6-60" aria-hidden="true"></a>    <span class="cf">if</span> (!STAILQ_EMPTY(&amp;qpair-&gt;queued_req) &amp;&amp; !qpair-&gt;ctrlr-&gt;is_resetting) {</span>
+<span id="cb6-61"><a href="#cb6-61" aria-hidden="true"></a>      req = STAILQ_FIRST(&amp;qpair-&gt;queued_req);</span>
+<span id="cb6-62"><a href="#cb6-62" aria-hidden="true"></a>      STAILQ_REMOVE_HEAD(&amp;qpair-&gt;queued_req, stailq);</span>
+<span id="cb6-63"><a href="#cb6-63" aria-hidden="true"></a>      nvme_qpair_submit_request(qpair, req);</span>
+<span id="cb6-64"><a href="#cb6-64" aria-hidden="true"></a>    }</span>
+<span id="cb6-65"><a href="#cb6-65" aria-hidden="true"></a>  }</span>
+<span id="cb6-66"><a href="#cb6-66" aria-hidden="true"></a>}</span></code></pre></div>
+<p>I kinda suspect the bad tail could attribute to <em>fail and retries</em>, it looks the completion entry might need retries for several reasons. However, it turns out there is NOT ANY retry in the middle when I run the <code>perf</code> tool.</p>
+<h3 id="further-experiments">Further Experiments</h3>
+<ul>
+<li><code>linux aio</code> has similar symotoms of random bad tail of polling function (<code>io_getevents</code>).</li>
+<li>SPDK-20.10 will have ~=200us tail, but average latency of 4K read raise from 6.57us to 8 us.</li>
+</ul>
+<h3 id="reference">Reference</h3>
+<ol type="1">
+<li>10.39M Storage I/O Per Second From One Thread. <a href="https://spdk.io/news/2019/05/06/nvme/">link</a></li>
+<li>SPDK Source code 18.04. <a href="https://github.com/spdk/spdk/tree/v18.04.x">github</a></li>
+</ol>
+    </section>
+</article>
+
+        </main>
+
+        <footer>
+            Site proudly generated by
+            <a href="http://jaspervdj.be/hakyll">Hakyll</a>
+        </footer>
+    </body>
+</html>
